@@ -62,7 +62,9 @@ def _clean_bio(raw):
     s = re.sub(r"[ \t]+\n", "\n", s)
     s = re.sub(r"\n{3,}", "\n\n", s)
     location = ""
-    m = re.match(r"\s*Location\s*:\s*([^\n]+)\n*", s, re.I)
+    # [:;] — a semicolon is one key from a colon, and at least one real bio
+    # ("Location; Plymouth Petsmart", May 2025) had exactly that typo.
+    m = re.match(r"\s*Location\s*[:;]\s*([^\n]+)\n*", s, re.I)
     if m:
         cand = m.group(1).strip().rstrip(".")
         # Only treat it as a place if it reads like one. Staff sometimes use the
