@@ -1,4 +1,4 @@
-name: Refresh animal data
+name: Refresh animal data 
 
 on:
   schedule:
