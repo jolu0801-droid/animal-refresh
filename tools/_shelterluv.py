@@ -46,8 +46,13 @@ def _fetch(url, timeout=45):
 
 
 def _clean_bio(raw):
-    """Shelterluv stores the bio as HTML. Turn it into plain text with blank
-    lines between paragraphs, which is what the site's renderer expects."""
+    """Shelterluv stores the bio as HTML. Returns (bio_text, location).
+
+    Staff write "Location: Rosemount, MN" as the bio's first line — often the
+    ONLY place the city exists (the attribute chips are state-level at best).
+    So the leading location line is CAPTURED and returned separately, not
+    discarded: the site shows it as the labelled Location fact, and the bio
+    itself starts with the actual writing."""
     s = str(raw or "")
     s = re.sub(r"(?i)<\s*br\s*/?\s*>", "\n", s)
     s = re.sub(r"(?i)</\s*p\s*>", "\n\n", s)
@@ -56,9 +61,19 @@ def _clean_bio(raw):
     s = s.replace("\r\n", "\n").replace("\r", "\n")
     s = re.sub(r"[ \t]+\n", "\n", s)
     s = re.sub(r"\n{3,}", "\n\n", s)
-    # The bio often repeats the location line the site already shows separately.
-    s = re.sub(r"^\s*Location:[^\n]*\n+", "", s)
-    return s.strip()
+    location = ""
+    m = re.match(r"\s*Location\s*:\s*([^\n]+)\n*", s, re.I)
+    if m:
+        cand = m.group(1).strip().rstrip(".")
+        # Only treat it as a place if it reads like one. Staff sometimes use the
+        # line for program notes ("Foster to Adopt option! Can be fostered in
+        # MN, SD, IA, WI, or NE") — a sentence like that belongs in the bio,
+        # not crammed into the little Location cell. Longest real place seen is
+        # "Norwood Young America, MN" (25 chars); 40 leaves generous room.
+        if len(cand) <= 40 and "!" not in cand:
+            location = cand
+            s = s[m.end():]
+    return s.strip(), location
 
 
 def _money(raw):
@@ -100,9 +115,11 @@ def rich_for(nid):
     if not d:
         return {}
     out = {}
-    bio = _clean_bio(d.get("kennel_description"))
+    bio, loc = _clean_bio(d.get("kennel_description"))
     if bio:
         out["description"] = bio
+    if loc:
+        out["location"] = loc
     price = _money(d.get("adoptionFee"))
     if price:
         out["fee"] = {"price": price}
