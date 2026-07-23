@@ -23,11 +23,13 @@ Cost: one small page (~13 KB) per animal. All 216 take about 13 seconds at the
 concurrency set here, which is fine for a build. The every-minute push job uses
 the incremental helper instead so it costs almost nothing per run.
 """
+import calendar
 import concurrent.futures
 import gzip
 import html as _html
 import json
 import re
+import time
 import urllib.request
 
 EMBED = "https://new.shelterluv.com/embed/animal/%s"
@@ -45,14 +47,41 @@ def _fetch(url, timeout=45):
     return raw.decode("utf-8", "replace")
 
 
+_MONTHS = {m: i + 1 for i, m in enumerate(
+    "january february march april may june july august september october november december".split())}
+
+
+def _parse_waiting_since(cand):
+    """"10/2024", "10-24", "October 2024", "Oct 2024" -> unix seconds (first of
+    that month, UTC), or 0 when it doesn't read like a month+year."""
+    m = re.match(r"^([A-Za-z]+|\d{1,2})\s*[/\-\., ]\s*(\d{2}|\d{4})$", cand.strip())
+    if not m:
+        return 0
+    mon_raw, yr_raw = m.group(1), m.group(2)
+    if mon_raw.isdigit():
+        mon = int(mon_raw)
+    else:
+        mon = next((v for k, v in _MONTHS.items() if k.startswith(mon_raw.lower())), 0)
+    yr = int(yr_raw) + (2000 if len(yr_raw) == 2 else 0)
+    if not (1 <= mon <= 12 and 2000 <= yr <= 2100):
+        return 0
+    ts = calendar.timegm((yr, mon, 1, 0, 0, 0))
+    return ts if ts < time.time() else 0        # a future month is a typo
+
+
 def _clean_bio(raw):
-    """Shelterluv stores the bio as HTML. Returns (bio_text, location).
+    """Shelterluv stores the bio as HTML. Returns (bio_text, location, waiting).
 
     Staff write "Location: Rosemount, MN" as the bio's first line — often the
     ONLY place the city exists (the attribute chips are state-level at best).
     So the leading location line is CAPTURED and returned separately, not
     discarded: the site shows it as the labelled Location fact, and the bio
-    itself starts with the actual writing."""
+    itself starts with the actual writing.
+
+    Same idea for "Waiting since: 10/2024": Shelterluv's intake date resets
+    when an animal comes back (Beau read as a June-2025 arrival when he'd
+    really been waiting since October 2024), so staff can state the real date
+    in the bio and the site's automatic "Waiting" badge uses it instead."""
     s = str(raw or "")
     s = re.sub(r"(?i)<\s*br\s*/?\s*>", "\n", s)
     s = re.sub(r"(?i)</\s*p\s*>", "\n\n", s)
@@ -62,20 +91,35 @@ def _clean_bio(raw):
     s = re.sub(r"[ \t]+\n", "\n", s)
     s = re.sub(r"\n{3,}", "\n\n", s)
     location = ""
-    # [:;] — a semicolon is one key from a colon, and at least one real bio
-    # ("Location; Plymouth Petsmart", May 2025) had exactly that typo.
-    m = re.match(r"\s*Location\s*[:;]\s*([^\n]+)\n*", s, re.I)
-    if m:
-        cand = m.group(1).strip().rstrip(".")
-        # Only treat it as a place if it reads like one. Staff sometimes use the
-        # line for program notes ("Foster to Adopt option! Can be fostered in
-        # MN, SD, IA, WI, or NE") — a sentence like that belongs in the bio,
-        # not crammed into the little Location cell. Longest real place seen is
-        # "Norwood Young America, MN" (25 chars); 40 leaves generous room.
-        if len(cand) <= 40 and "!" not in cand:
-            location = cand
-            s = s[m.end():]
-    return s.strip(), location
+    waiting = 0
+    # The two header lines may appear in either order; keep stripping leading
+    # lines as long as one of them matches. [:;] — a semicolon is one key from
+    # a colon, and at least one real bio ("Location; Plymouth Petsmart",
+    # May 2025) had exactly that typo. The colon itself is optional for the
+    # waiting line ("Waiting since 10/2024" reads naturally without one).
+    while True:
+        m = re.match(r"\s*Location\s*[:;]\s*([^\n]+)\n*", s, re.I)
+        if m and not location:
+            cand = m.group(1).strip().rstrip(".")
+            # Only treat it as a place if it reads like one. Staff sometimes
+            # use the line for program notes ("Foster to Adopt option! Can be
+            # fostered in MN, SD, IA, WI, or NE") — a sentence like that
+            # belongs in the bio, not crammed into the little Location cell.
+            # Longest real place seen is "Norwood Young America, MN"
+            # (25 chars); 40 leaves generous room.
+            if len(cand) <= 40 and "!" not in cand:
+                location = cand
+                s = s[m.end():]
+                continue
+        m = re.match(r"\s*Waiting\s+since\s*[:;]?\s*([^\n]+)\n*", s, re.I)
+        if m and not waiting:
+            ts = _parse_waiting_since(m.group(1).strip().rstrip("."))
+            if ts:
+                waiting = ts
+                s = s[m.end():]
+                continue
+        break
+    return s.strip(), location, waiting
 
 
 def _money(raw):
@@ -117,11 +161,13 @@ def rich_for(nid):
     if not d:
         return {}
     out = {}
-    bio, loc = _clean_bio(d.get("kennel_description"))
+    bio, loc, waiting = _clean_bio(d.get("kennel_description"))
     if bio:
         out["description"] = bio
     if loc:
         out["location"] = loc
+    if waiting:
+        out["waitingSince"] = waiting
     price = _money(d.get("adoptionFee"))
     if price:
         out["fee"] = {"price": price}
