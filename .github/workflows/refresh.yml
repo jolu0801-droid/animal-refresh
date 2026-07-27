@@ -1,33 +1,133 @@
-name: Refresh animal data 
+# Refreshes Rescue Network's adoptable-animal data (bios, fees, photos) into
+# Cloudflare KV. Runs on GitHub's servers, so no home computer needs to be on.
+#
+# This workflow touches ONLY the animal data in Cloudflare KV. It cannot deploy
+# or modify the website itself — the site's code isn't in this repository.
+#
+# The CLOUDFLARE_API_TOKEN repository secret is the only credential involved
+# (Settings -> Secrets and variables -> Actions -> New repository secret).
+#
+#
+# WHY ONE RUN REFRESHES MANY TIMES INSTEAD OF ONCE
+# ------------------------------------------------
+# GitHub throttles scheduled workflows hard. This one asks for every 5 minutes
+# and, over its first 78 runs, was actually started every 51-223 minutes
+# (median 85). Nothing was wrong with the job — GitHub simply skips most
+# firings of a */5 schedule on shared runners.
+#
+# That matters because push-animals-kv.py is tuned for a 5-minute cadence: it
+# re-reads 60 of the ~224 animals per run, so a full bio/fee pass is meant to
+# take ~20 minutes. At an 85-minute cadence the same rotation took ~6 hours.
+# And this data is not a nicety — Shelterluv's firewall blocks Cloudflare from
+# fetching them live (see _worker.js), so the site serves what this job last
+# wrote. Stale KV is a stale website.
+#
+# So the schedule is now only used to START a run. The run then refreshes every
+# 5 minutes for just under GitHub's 6-hour job limit. The next scheduled run
+# waits in the queue (see `concurrency`) and takes over the moment this one
+# ends, so coverage is effectively continuous.
+#
+# Two things this makes normal, which would otherwise look like faults:
+#   • The Actions list shows grey "cancelled" entries. Those are queued runs
+#     superseded by a newer queued run while this one was still going. Only one
+#     successor is ever kept, and cancelling the rest is how that is done.
+#   • A single failed refresh no longer fails the run. Shelterluv hiccups, and
+#     the job is designed to shrug one off and try again in 5 minutes. It gives
+#     up (and emails you) only after 6 failures in a row — 30 solid minutes of
+#     failure, which is a real outage rather than a hiccup.
+name: Refresh animal data
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
-  workflow_dispatch: {}
+    - cron: "*/5 * * * *"   # only needs to fire often enough to keep a successor queued
+  workflow_dispatch: {}      # the "Run workflow" button, for testing by hand
 
 permissions:
-  contents: write
+  contents: write            # lets the run save its own progress file back
 
 concurrency:
   group: refresh
-  cancel-in-progress: false
+  cancel-in-progress: false  # a queued run WAITS for this one; it never interrupts it
 
 jobs:
   refresh:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 350     # GitHub hard-kills at 360; the loop stops at 340 on its own
     steps:
       - uses: actions/checkout@v4
 
-      - name: Refresh animal data
+      # The script keeps a small progress file (which animals were re-read last,
+      # so it rotates instead of re-reading everything). GitHub runners forget
+      # everything between runs, so it gets committed back — hourly as crash
+      # insurance, and once more when the loop ends. These commits also count as
+      # repository activity, which stops GitHub from auto-disabling the schedule
+      # after 60 days of quiet.
+      - name: Refresh animal data every 5 minutes
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-        run: python3 tools/push-animals-kv.py
-
-      - name: Save progress
         run: |
+          set -uo pipefail
+
+          LOOP_MINUTES=340           # stop well short of GitHub's 6-hour hard kill
+          TICK_SECONDS=300           # the cadence push-animals-kv.py's rotation assumes
+          SAVE_EVERY_SECONDS=3600    # commit the progress file this often
+          MAX_FAIL_STREAK=6          # ~30 min of solid failure -> report the run as failed
+
           git config user.name "refresh-bot"
           git config user.email "actions@users.noreply.github.com"
-          git add -f tools/.animals-push-state.json
-          git diff --cached --quiet || git commit -m "refresh state [skip ci]"
-          git push
+
+          save_progress() {
+            git add -f tools/.animals-push-state.json || return 0
+            git diff --cached --quiet && return 0
+            git commit -q -m "refresh state [skip ci]" || return 0
+            git push -q && return 0
+            # Only reachable if something else pushed to this branch mid-run (a
+            # commit made by hand). Rebase onto it and try once more, rather
+            # than throwing away the progress this run has made. --autostash so
+            # a stray modified file in the tree can't refuse the rebase.
+            git pull --rebase --autostash -q && git push -q && return 0
+            echo "  (could not push progress — the next save will retry)"
+          }
+
+          deadline=$(( $(date +%s) + LOOP_MINUTES * 60 ))
+          next_save=$(( $(date +%s) + SAVE_EVERY_SECONDS ))
+          ticks=0; failed=0; streak=0; worst=0
+
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            started=$(date +%s)
+            ticks=$(( ticks + 1 ))
+
+            echo "::group::refresh $ticks — $(date -u '+%H:%M:%SZ')"
+            if python3 tools/push-animals-kv.py; then
+              streak=0
+            else
+              failed=$(( failed + 1 ))
+              streak=$(( streak + 1 ))
+              if [ "$streak" -gt "$worst" ]; then worst=$streak; fi
+              if [ "$streak" -lt "$MAX_FAIL_STREAK" ]; then
+                echo "::warning::refresh $ticks failed (${streak} in a row) — retrying in ${TICK_SECONDS}s"
+              else
+                echo "::warning::refresh $ticks failed (${streak} in a row)"
+              fi
+            fi
+            echo "::endgroup::"
+
+            if [ "$streak" -ge "$MAX_FAIL_STREAK" ]; then
+              save_progress
+              echo "::error::${streak} refreshes failed in a row — stopping so this run reports as failed"
+              exit 1
+            fi
+
+            if [ "$(date +%s)" -ge "$next_save" ]; then
+              save_progress
+              next_save=$(( $(date +%s) + SAVE_EVERY_SECONDS ))
+            fi
+
+            # Sleep the REMAINDER of the tick, so the 5-minute cadence holds
+            # steady instead of drifting by however long the refresh took.
+            rest=$(( started + TICK_SECONDS - $(date +%s) ))
+            if [ "$rest" -gt 0 ]; then sleep "$rest"; fi
+          done
+
+          save_progress
+          echo "$ticks refreshes over $LOOP_MINUTES minutes; $failed failed (longest run of failures: $worst)."
