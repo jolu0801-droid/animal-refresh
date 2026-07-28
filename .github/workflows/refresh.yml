@@ -77,15 +77,41 @@ jobs:
           git config user.email "actions@users.noreply.github.com"
 
           save_progress() {
+            # An earlier save in THIS run may have left a halted rebase behind.
+            # Clear it first so one bad save can't poison every later one.
+            git rebase --abort >/dev/null 2>&1 || true
+
             git add -f tools/.animals-push-state.json || return 0
             git diff --cached --quiet && return 0
             git commit -q -m "refresh state [skip ci]" || return 0
-            git push -q && return 0
-            # Only reachable if something else pushed to this branch mid-run (a
-            # commit made by hand). Rebase onto it and try once more, rather
-            # than throwing away the progress this run has made. --autostash so
-            # a stray modified file in the tree can't refuse the rebase.
-            git pull --rebase --autostash -q && git push -q && return 0
+            # stderr silenced: being rejected here is EXPECTED at a handoff, and a
+            # red git error block every few hours reads like a fault when it isn't.
+            # The retry below keeps its stderr, so a genuine failure still shows.
+            git push -q 2>/dev/null && return 0
+
+            # Push rejected: HEAD is behind. This happens at every handoff — a run
+            # checks out while the OUTGOING run is pushing its final save, so it
+            # starts one commit stale.
+            #
+            # Do NOT rebase here. Both sides always modify the same progress file,
+            # so a rebase hits a conflict, halts, and leaves the repo mid-rebase —
+            # which then fails every remaining save for the rest of the loop.
+            # That is exactly what happened on 2026-07-28: run #84 looped the full
+            # 341 minutes, reported success, and committed nothing for 6h41m.
+            #
+            # This file is only ever written by this job, and our copy is always
+            # the newer one, so there is nothing to merge. Reset onto the remote
+            # (--mixed keeps our file in the working tree) and replay it on top.
+            git fetch -q origin "${GITHUB_REF_NAME:-main}" || return 0
+            git reset -q --mixed FETCH_HEAD
+            git add -f tools/.animals-push-state.json || return 0
+            git diff --cached --quiet && return 0
+            git commit -q -m "refresh state [skip ci]" || return 0
+            git push -q && {
+              echo "  (handoff: replayed progress on top of the previous run's final save)"
+              return 0
+            }
+
             echo "  (could not push progress — the next save will retry)"
           }
 
