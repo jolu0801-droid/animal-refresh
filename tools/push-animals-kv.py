@@ -102,6 +102,29 @@ RICH_ROTATE_EVERY = 4 * 60         # rotate on essentially every run (job runs e
 RICH_ROTATE_SIZE = 60              # animals re-read per run (~4 runs = ~20 min full pass)
 MAX_SCRAPE_PER_RUN = 80            # hard ceiling on embed-page reads per run (burst guard)
 
+# ---- IndexNow: announce newly listed animals ------------------------------
+# Without this, a search engine finds a new /animal/<id> page only when it next
+# re-crawls /animals-sitemap.xml, which can take days. These pages have a short
+# useful life — the animal gets adopted — so days matter.
+#
+# GOOGLE IS NOT PART OF THIS, and cannot be. Google never adopted IndexNow, its
+# own Indexing API accepts only JobPosting and BroadcastEvent pages (an
+# adoptable animal is neither), and it retired the sitemap ping endpoint in
+# 2023. For Google these pages are still discovered through the sitemap, and
+# nothing here changes that. This covers Bing, Yandex, Naver, Seznam, Yep and
+# Amazon — worth having on a page that is only useful for a few weeks.
+#
+# The key is public by design: the engines verify it by fetching
+# INDEXNOW_KEY_URL. It must stay identical to the .txt file at the site root,
+# which ships with a normal site deploy. If that file is missing or stale the
+# submissions are refused (403/422) and this prints why — nothing else breaks.
+SITE_ORIGIN = "https://rescuenetworkmn.org"
+INDEXNOW_KEY = "2c02e9585c54092a7b6a3faeec1db8cd"
+INDEXNOW_KEY_URL = "%s/%s.txt" % (SITE_ORIGIN, INDEXNOW_KEY)
+INDEXNOW_ENDPOINT = "https://api.indexnow.org/indexnow"
+INDEXNOW_MAX_PER_RUN = 100         # burst guard; a real intake is a handful
+INDEXNOW_FORGET_DAYS = 60          # re-announce an animal re-listed after this long
+
 TOKEN = _secrets.get("CLOUDFLARE_API_TOKEN")
 ACCOUNT_ID = _secrets.get("CLOUDFLARE_ACCOUNT_ID")
 NAMESPACE_ID = _secrets.get("RN_ANIMALS_KV_ID")
@@ -245,6 +268,92 @@ def refresh_rich(animals, state):
     return cached
 
 
+def animal_url_id(a):
+    """The id used in /animal/<id> URLs.
+
+    This must match slNormalizeV3() in _worker.js exactly, because that is what
+    builds /animals-sitemap.xml: the tail of uniqueId ("RNMN-A-2101" -> "2101"),
+    falling back to nid. They are NOT the same number — the animal above is
+    uniqueId RNMN-A-2101 but nid 206974007 — so deriving these from nid would
+    announce 279 URLs that do not exist.
+    """
+    code = str(a.get("uniqueId") or "").strip()
+    if "-" in code:
+        return code[code.rindex("-") + 1:]
+    return str(a.get("nid") or "").strip()
+
+
+def ping_indexnow(animals, state):
+    """Announce animals that have appeared since the last run. Never raises.
+
+    Only genuinely NEW pages are sent. Re-submitting URLs that have not changed
+    is how a site gets its IndexNow submissions quietly deprioritised, so each
+    animal is announced once and then remembered in the state file.
+
+    This runs only after KV has already been written. A search-engine ping
+    failing is not a reason to fail a run whose real job — keeping the site's
+    animal data fresh — has already succeeded.
+    """
+    try:
+        now = time.time()
+        known = dict(state.get("indexnowSeen") or {})
+
+        # Mirror the sitemap's own filter (needs an id and a name, deduped), so
+        # we never announce a URL the sitemap itself would not list.
+        ids, seen_ids = [], set()
+        for a in animals:
+            i = animal_url_id(a)
+            if i and str(a.get("name") or "").strip() and i not in seen_ids:
+                seen_ids.add(i)
+                ids.append(i)
+
+        # First run after this shipped, or after the state file was lost:
+        # remember the roster WITHOUT announcing it. Those pages are already
+        # indexed, and 279 "new" URLs at once is exactly the noise that gets a
+        # site's submissions ignored.
+        if not known:
+            state["indexnowSeen"] = dict((i, now) for i in ids)
+            print("  IndexNow: remembered %d existing animals (none announced — "
+                  "only newly listed animals are)" % len(ids))
+            return
+
+        fresh = [i for i in ids if i not in known]
+        if fresh:
+            batch = fresh[:INDEXNOW_MAX_PER_RUN]
+            body = json.dumps({
+                "host": SITE_ORIGIN.split("//", 1)[1],
+                "key": INDEXNOW_KEY,
+                "keyLocation": INDEXNOW_KEY_URL,
+                "urlList": ["%s/animal/%s" % (SITE_ORIGIN, i) for i in batch],
+            }).encode("utf-8")
+            req = urllib.request.Request(INDEXNOW_ENDPOINT, data=body, method="POST")
+            req.add_header("Content-Type", "application/json; charset=utf-8")
+            with urllib.request.urlopen(req, timeout=30) as r:
+                status = r.getcode()
+            print("  IndexNow: announced %d new animal page(s) — HTTP %s" % (len(batch), status))
+            for i in batch:
+                known[i] = now
+            if len(fresh) > len(batch):
+                print("  IndexNow: %d more queued for the next run" % (len(fresh) - len(batch)))
+
+        # Forget animals that are both long gone from the roster and long since
+        # announced, so a genuine re-listing months later is announced again.
+        listed = set(ids)
+        state["indexnowSeen"] = dict(
+            (i, t) for i, t in known.items()
+            if i in listed or (now - float(t)) < INDEXNOW_FORGET_DAYS * 86400)
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")[:200].replace("\n", " ")
+        hint = ""
+        if e.code == 403:
+            hint = " — is %s deployed yet?" % INDEXNOW_KEY_URL
+        elif e.code == 422:
+            hint = " — key/host mismatch against %s" % INDEXNOW_KEY_URL
+        print("  (IndexNow declined: HTTP %d%s %s)" % (e.code, hint, detail))
+    except Exception as e:
+        print("  (IndexNow ping failed: %s — animals are in KV regardless)" % e)
+
+
 def main():
     if not TOKEN:
         sys.exit("No Cloudflare API token found.\n"
@@ -322,6 +431,10 @@ def main():
         sys.exit("Cloudflare reported failure: %s" % json.dumps(res.get("errors"))[:300])
 
     state["digest"] = digest
+    # After the write, never before: the ping is a nice-to-have and must not be
+    # able to stop KV being updated. (A run with no change returns above, which
+    # is correct — a new animal always changes the digest.)
+    ping_indexnow(animals, state)
     save_state(state)
     print("\nPushed. %d animals live in KV (%d in saved queries, %d with bios)."
           % (len(animals), sum(len(v) for v in saved.values()), hits))
