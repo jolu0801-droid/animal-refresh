@@ -54,7 +54,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 350     # GitHub hard-kills at 360; the loop stops at 340 on its own
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5   # v5 targets Node 24; v4 raised a Node 20 deprecation warning on every run
 
       # The script keeps a small progress file (which animals were re-read last,
       # so it rotates instead of re-reading everything). GitHub runners forget
@@ -65,6 +65,10 @@ jobs:
       - name: Refresh animal data every 5 minutes
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          # Optional. Lets the site send its new-arrivals digest emails on a
+          # schedule (see _worker.js, /api/new-arrivals/run). Same value as the
+          # Pages secret NA_CRON_TOKEN; the poke below is skipped until it exists.
+          NA_CRON_TOKEN: ${{ secrets.NA_CRON_TOKEN }}
         run: |
           set -uo pipefail
 
@@ -115,6 +119,12 @@ jobs:
             echo "  (could not push progress — the next save will retry)"
           }
 
+          # If GitHub shuts the runner down under us (SIGTERM -> exit 143, as on
+          # 2026-09-12 run #991 at 4h20m), save the rotation state before dying so
+          # the successor does not restart the re-read cycle from an hour-old save.
+          # The successor takes over on its own either way (see concurrency above).
+          trap 'echo "SIGTERM received - saving progress before exit"; save_progress; exit 143' TERM
+
           deadline=$(( $(date +%s) + LOOP_MINUTES * 60 ))
           next_save=$(( $(date +%s) + SAVE_EVERY_SECONDS ))
           ticks=0; failed=0; streak=0; worst=0
@@ -137,6 +147,19 @@ jobs:
               fi
             fi
             echo "::endgroup::"
+
+            # New-arrivals digest: ask the site whether a send is due. It answers
+            # "nothing due" almost every time and only builds + sends a Brevo
+            # campaign at the scheduled hour, so this is cheap to ask every tick.
+            if [ -n "${NA_CRON_TOKEN:-}" ]; then
+              na=$(curl -sS -m 120 -X POST -H "Authorization: Bearer $NA_CRON_TOKEN" \
+                     "https://rescuenetworkmn.org/api/new-arrivals/run" 2>&1 | head -c 600) \
+                || echo "::warning::new-arrivals poke failed: ${na}"
+              case "$na" in
+                *'"sent":[]'*) : ;;                             # the normal quiet answer
+                *) echo "  new-arrivals: ${na}" ;;
+              esac
+            fi
 
             if [ "$streak" -ge "$MAX_FAIL_STREAK" ]; then
               save_progress
