@@ -196,6 +196,25 @@ def resolve_namespace(account):
         "namespace), or set RN_ANIMALS_KV_ID to an existing namespace id." % NAMESPACE_TITLE)
 
 
+def kv_saved_query(q):
+    """The list the last successful push stored for saved query q, read back
+    out of KV. Only needed when the state file has no copy yet (the first run
+    after 2026-09-27, or a lost state file). Any problem returns []."""
+    try:
+        account = resolve_account()
+        namespace = resolve_namespace(account)
+        req = urllib.request.Request(CF + "/accounts/%s/storage/kv/namespaces/%s/values/%s"
+                                     % (account, namespace, KV_KEY))
+        req.add_header("Authorization", "Bearer " + TOKEN)
+        with urllib.request.urlopen(req, timeout=120) as r:
+            payload = json.loads(r.read().decode("utf-8"))
+        rows = (payload.get("savedQueries") or {}).get(q) or []
+        return rows if isinstance(rows, list) else []
+    except (Exception, SystemExit) as e:   # cf_api raises SystemExit on HTTP errors
+        print("  (could not read saved query %s back from KV: %s)" % (q, str(e).strip()[:200]))
+        return []
+
+
 def load_state():
     try:
         return json.load(io.open(STATE_FILE, encoding="utf-8"))
@@ -369,26 +388,40 @@ def main():
     # A saved query that comes back empty or errors is NOT written as "no
     # animals". Publishing that would delete a list the deployed snapshot still
     # has, and the worker would then treat a live foster-to-adopt animal as
-    # adopted. Better to abort and leave yesterday's good data in place.
+    # adopted (or fall back to the deploy's much older copy).
+    #
+    # It must not stop the rest of the refresh either. Until 2026-09-27 it
+    # aborted the whole push, and when saved query 13320 started answering a
+    # clean empty list, every refresh failed and ALL of the site's animal data
+    # froze for hours. So an empty or failed list now keeps the list from the
+    # last good push (state file first, else read back from KV) and says so as
+    # a warning, and everything else still refreshes.
+    state = load_state()
     saved = {}
+    good = state.setdefault("lastGoodSavedQueries", {})
     for q in SAVED_QUERIES:
         try:
             rows = shelterluv(FEED + "?saved_query=" + q).get("animals") or []
+            why = "returned no animals"
         except Exception as e:
-            sys.exit("ERROR: saved query %s could not be fetched (%s).\n"
-                     "Nothing was written — KV still holds the previous good data." % (q, e))
-        if not rows:
-            sys.exit("ERROR: saved query %s returned no animals.\n"
-                     "That is usually a Shelterluv hiccup rather than a real empty list, so\n"
-                     "nothing was written — KV still holds the previous good data." % q)
-        saved[q] = rows
+            rows, why = [], "could not be fetched (%s)" % e
+        if rows:
+            saved[q] = good[q] = rows
+            continue
+        keep = good.get(q) or kv_saved_query(q)
+        if keep:
+            saved[q] = good[q] = keep
+            print("::warning::Saved query %s %s. Keeping the %d animals from the last good "
+                  "push; the rest of the refresh goes ahead." % (q, why, len(keep)))
+        else:
+            print("::warning::Saved query %s %s and no earlier list exists. It is left out, "
+                  "so the site falls back to the copy bundled with its last deploy." % (q, why))
 
     # Full UTC timestamp, not just a date: at a 30-minute cadence several
     # pushes share a day, and the worker decides between this and the deployed
     # snapshot by comparing these strings. ISO-8601 sorts correctly as text,
     # and a timestamp always sorts after the bare date a deploy writes.
     # ---- bios / fees / videos, from the keyed api, only when needed ----
-    state = load_state()
     membership = hashlib.sha256(
         json.dumps(sorted(str(a.get("nid")) for a in animals)).encode("utf-8")).hexdigest()
     rich = refresh_rich(animals, state)
