@@ -199,7 +199,8 @@ def resolve_namespace(account):
 def kv_saved_query(q):
     """The list the last successful push stored for saved query q, read back
     out of KV. Only needed when the state file has no copy yet (the first run
-    after 2026-09-27, or a lost state file). Any problem returns []."""
+    after 2026-09-27, or a lost state file). An empty list is a real answer and
+    comes back as []; None means KV has no list for q (or could not be read)."""
     try:
         account = resolve_account()
         namespace = resolve_namespace(account)
@@ -208,11 +209,11 @@ def kv_saved_query(q):
         req.add_header("Authorization", "Bearer " + TOKEN)
         with urllib.request.urlopen(req, timeout=120) as r:
             payload = json.loads(r.read().decode("utf-8"))
-        rows = (payload.get("savedQueries") or {}).get(q) or []
-        return rows if isinstance(rows, list) else []
+        rows = (payload.get("savedQueries") or {}).get(q)
+        return rows if isinstance(rows, list) else None
     except (Exception, SystemExit) as e:   # cf_api raises SystemExit on HTTP errors
         print("  (could not read saved query %s back from KV: %s)" % (q, str(e).strip()[:200]))
-        return []
+        return None
 
 
 def load_state():
@@ -385,37 +386,42 @@ def main():
         sys.exit("ERROR: Shelterluv returned no animals — refusing to overwrite KV with an\n"
                  "empty list. Nothing was changed.")
 
-    # A saved query that comes back empty or errors is NOT written as "no
-    # animals". Publishing that would delete a list the deployed snapshot still
-    # has, and the worker would then treat a live foster-to-adopt animal as
-    # adopted (or fall back to the deploy's much older copy).
+    # Whatever Shelterluv ANSWERS for a saved query is written as is, empty
+    # included. An empty list is a real state: on 2026-09-27 staff took the
+    # Foster to Adopt attribute off every dog, and because this treated the
+    # empty answer as a glitch, /foster-to-adopt kept showing seven dogs until
+    # 09-30, five of them already adopted.
     #
-    # It must not stop the rest of the refresh either. Until 2026-09-27 it
-    # aborted the whole push, and when saved query 13320 started answering a
-    # clean empty list, every refresh failed and ALL of the site's animal data
-    # froze for hours. So an empty or failed list now keeps the list from the
-    # last good push (state file first, else read back from KV) and says so as
-    # a warning, and everything else still refreshes.
+    # Only a FAILED fetch (an error, or a reply with no "animals" list) keeps
+    # the list from the last good push (state file first, else read back from
+    # KV), with a warning. A failure must not stop the rest of the refresh
+    # either: until 2026-09-27 it aborted the whole push, which froze ALL of
+    # the site's animal data for hours.
     state = load_state()
     saved = {}
     good = state.setdefault("lastGoodSavedQueries", {})
     for q in SAVED_QUERIES:
         try:
-            rows = shelterluv(FEED + "?saved_query=" + q).get("animals") or []
-            why = "returned no animals"
+            rows = shelterluv(FEED + "?saved_query=" + q).get("animals")
+            if not isinstance(rows, list):
+                raise ValueError("the reply has no animals list")
         except Exception as e:
-            rows, why = [], "could not be fetched (%s)" % e
-        if rows:
-            saved[q] = good[q] = rows
+            keep = good.get(q)
+            if keep is None:
+                keep = kv_saved_query(q)
+            if keep is not None:
+                saved[q] = good[q] = keep
+                print("::warning::Saved query %s could not be fetched (%s). Keeping the %d "
+                      "animals from the last good push; the rest of the refresh goes ahead."
+                      % (q, e, len(keep)))
+            else:
+                print("::warning::Saved query %s could not be fetched (%s) and no earlier list "
+                      "exists. It is left out, so the site falls back to the copy bundled "
+                      "with its last deploy." % (q, e))
             continue
-        keep = good.get(q) or kv_saved_query(q)
-        if keep:
-            saved[q] = good[q] = keep
-            print("::warning::Saved query %s %s. Keeping the %d animals from the last good "
-                  "push; the rest of the refresh goes ahead." % (q, why, len(keep)))
-        else:
-            print("::warning::Saved query %s %s and no earlier list exists. It is left out, "
-                  "so the site falls back to the copy bundled with its last deploy." % (q, why))
+        saved[q] = good[q] = rows
+        if not rows:
+            print("  saved query %s is empty in Shelterluv, so its page shows none" % q)
 
     # Full UTC timestamp, not just a date: at a 30-minute cadence several
     # pushes share a day, and the worker decides between this and the deployed
