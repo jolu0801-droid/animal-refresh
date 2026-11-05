@@ -27,6 +27,16 @@
 # waits in the queue (see `concurrency`) and takes over the moment this one
 # ends, so coverage is effectively continuous.
 #
+# ...EXCEPT when the schedule fires nothing at all. On 2026-11-05 it did not
+# start a single run from 05:51 to 13:35 UTC: run #1287 ended at 11:39 with no
+# successor queued, the site's animal data froze, and a dog listed that morning
+# went out on Facebook with the site's footer badge as its link picture. So each
+# run now queues its own successor (workflow_dispatch, below) as soon as its
+# first refresh succeeds, and the schedule is only a backup. A run that never
+# succeeds queues nothing, so a long outage cannot set off back-to-back runs.
+# To stop the chain: Actions -> Refresh animal data -> "..." -> Disable workflow
+# (a disabled workflow cannot be dispatched).
+#
 # Two things this makes normal, which would otherwise look like faults:
 #   • The Actions list shows grey "cancelled" entries. Those are queued runs
 #     superseded by a newer queued run while this one was still going. Only one
@@ -44,6 +54,7 @@ on:
 
 permissions:
   contents: write            # lets the run save its own progress file back
+  actions: write             # lets the run queue its own successor (gh workflow run)
 
 concurrency:
   group: refresh
@@ -69,6 +80,9 @@ jobs:
           # schedule (see _worker.js, /api/new-arrivals/run). Same value as the
           # Pages secret NA_CRON_TOKEN; the poke below is skipped until it exists.
           NA_CRON_TOKEN: ${{ secrets.NA_CRON_TOKEN }}
+          # For queuing the successor. GITHUB_TOKEN can start workflow_dispatch
+          # runs (the one kind of run it is allowed to trigger).
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -uo pipefail
 
@@ -127,7 +141,7 @@ jobs:
 
           deadline=$(( $(date +%s) + LOOP_MINUTES * 60 ))
           next_save=$(( $(date +%s) + SAVE_EVERY_SECONDS ))
-          ticks=0; failed=0; streak=0; worst=0
+          ticks=0; failed=0; streak=0; worst=0; queued=0
 
           while [ "$(date +%s)" -lt "$deadline" ]; do
             started=$(date +%s)
@@ -136,6 +150,18 @@ jobs:
             echo "::group::refresh $ticks — $(date -u '+%H:%M:%SZ')"
             if python3 tools/push-animals-kv.py; then
               streak=0
+              # Keep the chain alive without the schedule (see the 2026-11-05
+              # note at the top): once this run has proved healthy, queue its
+              # successor. `concurrency` holds it until this run ends, or is
+              # killed, and then it starts at once. Retried each tick until it takes.
+              if [ "$queued" -eq 0 ]; then
+                if gh workflow run refresh.yml --ref "${GITHUB_REF_NAME:-main}" --repo "$GITHUB_REPOSITORY"; then
+                  queued=1
+                  echo "  (successor queued)"
+                else
+                  echo "::warning::could not queue the next run (the schedule is still the backup)"
+                fi
+              fi
             else
               failed=$(( failed + 1 ))
               streak=$(( streak + 1 ))
